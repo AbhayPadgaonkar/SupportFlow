@@ -7,7 +7,4 @@ model/test.py
 prepared
 tokens_test.py
 supportflow 
-model/finetune_test.py
-model/rag_debug.py
-mode/rag_test.py
-model/rag_test.py
+
