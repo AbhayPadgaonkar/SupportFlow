@@ -11,10 +11,7 @@ from pydantic import BaseModel
 import uvicorn
 from typing import Optional
 
-# ---------------------------------------------------------
-# CONFIGURATION
-# ---------------------------------------------------------
-CHECKPOINT_PATH = "../model/checkpoints_inst/inst_tune_final.pt" 
+CHECKPOINT_PATH = "../model/checkpoints_inst/inst_tune_final.pt"
 TOKENIZER_FILE = "../tokens/tokenizer.json"
 KB_FILE = "../prepared/kb_chunks.jsonl"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -23,9 +20,6 @@ CMD_CHAT = "Respond as an IT support assistant."
 CMD_CLASSIFY = "Categorize the IT support ticket."
 CMD_PRIORITY = "Determine if the ticket is high, medium, or low priority."
 
-# ---------------------------------------------------------
-# MODEL COMPONENTS (UNCHANGED)
-# ---------------------------------------------------------
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
@@ -43,33 +37,26 @@ class MultiHeadSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.qkv = nn.Linear(dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
-        
     def forward(self, x, mask, rope_sin, rope_cos):
         B, T, C = x.shape
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
-        
         q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        
         def apply_rope(x, sin, cos):
             def rotate_half(x):
                 x1 = x[..., :x.shape[-1]//2]
                 x2 = x[..., x.shape[-1]//2:]
                 return torch.cat([-x2, x1], dim=-1)
             return (x * cos) + (rotate_half(x) * sin)
-
         rope_sin = rope_sin[:, :, :T, :]
         rope_cos = rope_cos[:, :, :T, :]
-        
         q = apply_rope(q, rope_sin, rope_cos)
         k = apply_rope(k, rope_sin, rope_cos)
-        
         att = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
         att = att.masked_fill(mask == 0, float('-inf'))
         att = torch.softmax(att, dim=-1)
-        
         y = att @ v
         return self.proj(y.transpose(1, 2).contiguous().view(B, T, C))
 
@@ -103,103 +90,57 @@ class TransformerLM(nn.Module):
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
         self.lm_head.weight = self.token_emb.weight
         self.head_dim = dim // num_heads
-        
         pos = torch.arange(max_seq_len)
         freqs = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2) / self.head_dim))
         sinusoid = torch.einsum("i,j->ij", pos, freqs)
-
         rope_sin = torch.cat([sinusoid.sin(), sinusoid.sin()], dim=-1)
         rope_cos = torch.cat([sinusoid.cos(), sinusoid.cos()], dim=-1)
-        
         self.register_buffer("rope_sin", rope_sin.unsqueeze(0).unsqueeze(0))
         self.register_buffer("rope_cos", rope_cos.unsqueeze(0).unsqueeze(0))
-
     def forward(self, idx):
         B, T = idx.shape
         x = self.token_emb(idx)
         mask = torch.tril(torch.ones((1, 1, T, T), device=idx.device))
-        
         rope_sin = self.rope_sin[:, :, :T, :]
         rope_cos = self.rope_cos[:, :, :T, :]
-        
         for blk in self.blocks:
             x = blk(x, mask, rope_sin, rope_cos)
         return self.lm_head(self.norm(x))
 
-# ---------------------------------------------------------
-# SUPPORTFLOW BOT (UPDATED FOR API RETURN)
-# ---------------------------------------------------------
-
 class SupportBot:
     def __init__(self):
-        print("Initializing SupportFlow (RAG + Primed)...")
-        try:
-            self.tokenizer = Tokenizer.from_file(TOKENIZER_FILE)
-        except Exception as e:
-            print(f"Error loading tokenizer: {e}")
-            sys.exit(1)
-        
-        print(f"Loading Model: {CHECKPOINT_PATH}")
+        self.tokenizer = Tokenizer.from_file(TOKENIZER_FILE)
         self.model = TransformerLM().to(DEVICE)
-        
-        if not os.path.exists(CHECKPOINT_PATH):
-            print("Error: Checkpoint file not found!")
-            sys.exit(1)
-            
         ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.model.eval()
-
-        print("Loading Knowledge Base...")
         if os.path.exists(KB_FILE):
-            self.df = pd.read_json(KB_FILE, lines=True)
-            self.kb_docs = self.df["text"].tolist()
-
+            df = pd.read_json(KB_FILE, lines=True)
+            self.kb_docs = df["text"].tolist()
             self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
             self.kb_embeddings = self.embedder.encode(self.kb_docs, convert_to_tensor=True)
-
-            print(f"Loaded {len(self.kb_docs)} KB documents.")
         else:
-            print("Warning: KB file not found.")
             self.kb_docs = []
-        print("System Ready.")
-
-
-    def search_rag(self, query, threshold=0.45):
+    def search_rag(self, query, threshold=0.60):
         if not self.kb_docs:
             return None, 0.0
-
-        query_emb = self.embedder.encode(query, convert_to_tensor=True)
-        scores = torch.mm(query_emb.unsqueeze(0), self.kb_embeddings.transpose(0, 1))[0]
-        
-        top_k = torch.topk(scores, k=1)
-
-        score_val = top_k.values[0].item()
-        idx = top_k.indices[0].item()
-        found_text = self.kb_docs[idx]
-
-        print(f"\n[RAG] Hit: {score_val:.4f} | {found_text[:60]}...")
-
-        if score_val > threshold:
-            # RETURN BOTH TEXT AND SCORE
-            return found_text, score_val
-
-        print("[RAG] Match too weak → Ignoring.")
-        return None, score_val
-
-
+        q = self.embedder.encode(query, convert_to_tensor=True)
+        scores = torch.mm(q.unsqueeze(0), self.kb_embeddings.transpose(0, 1))[0]
+        top = torch.topk(scores, k=1)
+        score = top.values[0].item()
+        idx = top.indices[0].item()
+        if score > threshold:
+            return self.kb_docs[idx], score
+        return None, score
     def clean_text(self, text):
-        text = re.sub(r'http\S+', '', text)
+        text = re.sub(r"http\S+", "", text)
         return text.replace("\r", " ").replace("\n", " ").strip()
-
-
     def predict(self, user_input, mode="chat"):
         clean_in = self.clean_text(user_input)
         rag_context = ""
         rag_text_out = None
         rag_score_out = 0.0
         primer = ""
-
         if mode == "classify":
             instruction = CMD_CLASSIFY
             max_tokens = 15
@@ -213,58 +154,41 @@ class SupportBot:
             max_tokens = 200
             temperature = 0.2
             primer = "Dear"
-
-            # Retrieve RAG info
-            hit_text, hit_score = self.search_rag(clean_in, threshold=0.40)
-            
+            hit_text, hit_score = self.search_rag(clean_in, threshold=0.60)
             if hit_text:
                 rag_text_out = hit_text
                 rag_score_out = hit_score
                 clean_hit = hit_text.replace("User:", "").replace("Assistant:", "")
-                rag_context = f"Context Information:\n{clean_hit[:350]}\n"
-
+                rag_context = f"{clean_hit[:120]}"
         final_input = ""
         if rag_context:
-            final_input += f"Relevant Past Tickets:\n{rag_context}\n"
-        final_input += f"User Ticket:\n{clean_in}"
-
+            final_input += f"Additional context (use only if relevant): {rag_context}\n\n"
+        final_input += f"Ticket: {clean_in}"
         prompt = (
             f"{instruction}\n"
             f"{final_input}\n\n"
             f"### Response:\n"
             f"{primer}"
         )
-
         ids = self.tokenizer.encode(prompt).ids
         idx = torch.tensor(ids, dtype=torch.long, device=DEVICE).unsqueeze(0)
-
         out_text = primer
         eos_id = self.tokenizer.token_to_id("</s>")
-
         for _ in range(max_tokens):
             with torch.no_grad():
                 logits = self.model(idx)
             logits = logits[:, -1, :]
             probs = torch.softmax(logits / temperature, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
-
             if eos_id is not None and idx_next.item() == eos_id:
                 break
-
             token = self.tokenizer.decode([idx_next.item()])
             out_text += token
-
             idx = torch.cat((idx, idx_next), dim=1)
             if idx.shape[1] >= 512:
                 break
-        
-        # Return tuple: (Generated Text, RAG Text, RAG Score)
         return out_text.strip(), rag_text_out, rag_score_out
 
-
-# ---------------------------------------------------------
-# API CONFIGURATION
-# ---------------------------------------------------------
 bot = SupportBot()
 app = FastAPI(title="SupportFlow API")
 
@@ -282,14 +206,9 @@ class TicketResponse(BaseModel):
 async def predict_ticket(request: TicketRequest):
     try:
         user_in = request.ticket_text
-        
-        # Classification & Priority (Usually don't use RAG, ignoring the extra returns)
         cat, _, _ = bot.predict(user_in, "classify")
         prio, _, _ = bot.predict(user_in, "priority")
-        
-        # Chat Generation (Capturing RAG data here)
         reply, rag_text, rag_score = bot.predict(user_in, "chat")
-        
         return {
             "category": cat,
             "priority": prio,
@@ -301,5 +220,4 @@ async def predict_ticket(request: TicketRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    print("\nStarting SupportFlow API server on port 8000...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
