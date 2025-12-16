@@ -12,3 +12,6 @@ supportflow
 __pycache__/
 *.py[cod]
 *$py.class
+
+email_service/credentials.json
+email_service/token.pickle
